@@ -266,6 +266,10 @@ def _pallas_call_impl_interpret(
 
     carry_consts_ins, scratch = split_list(carry_blocks, [num_inout_blocks])
     with pallas_core.grid_env(local_grid_env):
+      for s in scalars:
+        aval = jax_core.get_aval(s)
+        if isinstance(aval, jax_core.DShapedArray):
+          s.aval = aval.update(dtype=jnp.int32)
       start_indices = [
           None if bm is None else bm.compute_start_indices_interpret(loop_idx, *scalars)
           for bm in grid_mapping.block_mappings]
@@ -280,10 +284,6 @@ def _pallas_call_impl_interpret(
           len(blocks),
           len(scratch_values),
       )
-      for s in scalars:
-        aval = jax_core.get_aval(s)
-        if isinstance(aval, jax_core.DShapedArray):
-          s.aval = aval.update(dtype=jnp.int32)
 
       blocks = jax_core.eval_jaxpr(
           discharged_jaxpr, discharged_consts, *scalars, *blocks, *scratch
@@ -823,6 +823,14 @@ def _pallas_call_batching_rule(
   else:
     batched_cost_estimate = None
 
+  # Start the ragged handling code
+  # Here, we:
+  #  - Rewrite the indexer to save memory (skip indices outside the ragged bounds)
+  #  - Rewrite the kernel to save compute (skip elements outside the ragged bounds)
+  #  - Update various internal structures/metadata to account for the new
+  #    block spec.
+  #  - Set the hacky flag of ragged_originating on the mapping, to signal to
+  #    the lowering code to treat mapped dimensions as part of the user grid.
   if lengths_aval:
     batched_grid_mapping = batched_grid_mapping.replace(
         get_grid_indices=lambda indices, maybe_include_mapped_dims: indices,
@@ -893,14 +901,98 @@ def _pallas_call_batching_rule(
 
       if debug_zero_fill_counterfactual:
 
-        @jax.experimental.pallas.when(i_idx >= b_len)
+        @jax.experimental.pallas.when(i_idx > b_len)
         def g():
           for arg_ref in args:
-            arg_ref[...] = jnp.zeros_like(arg_ref)
+            arg_ref[...] = jnp.full(arg_ref.shape, 0, dtype=jnp.float32)
 
     kernel_avals = [lengths_aval] + [v.aval for v in jaxpr.invars]
     flat_kernel_avals, kernel_in_tree = tree_util.tree_flatten(
         list(kernel_avals)
+    )
+
+    def _rewrite_index_jaxpr(batched_block_mapping):
+      indexer_avals = [
+          v.aval for v in batched_block_mapping.index_map_jaxpr.jaxpr.invars
+      ]
+      flat_indexer_avals, indexer_in_tree = tree_util.tree_flatten(
+          list(indexer_avals)
+      )
+
+      def index_rewrite_kernel(*args):
+        lengths_ref = args[-1]
+        # Lengths are always the last argument of the indexer.
+        # lengths_ref = args[-1]
+        # Invariant: Stacked axis is enforced to be the mapped axis above.
+        b_idx = args[stacked_axis]
+
+        val_at_ragged_dim = batched_block_mapping.block_shape[ragged_axis_dim]
+
+        # The current index into the ragged dimension.
+        # Invariant: There is only one ragged dimension, enforced above.
+        i_idx = args[ragged_axis_dim]
+
+        # grid space -> element space
+        i_len = i_idx * val_at_ragged_dim
+
+        # The length of the current batch.
+        b_len = lengths_ref[b_idx]
+
+        # Have we reached the end of the current batch?
+        not_done = i_len < b_len
+
+        am_last_batch = b_idx == axis_size - 1
+        last_good_block = lax.div(b_len, val_at_ragged_dim) - 1
+
+        # The logic below can be thought of as:
+        #  if index_oob_ragged:
+        #    if not last_batch:
+        #      batch_idx += 1
+        #      ragged_idx = 0
+        #    else:
+        #      ragged_idx = last_good_block
+        #
+        # wherein we find the next good block by incrementing the batch index
+        # and setting the ragged index to 0 if we are not in the last batch.
+        # Otherwise, we set the ragged index to the last good block.
+        b_next = jnp.where(
+            not_done, b_idx, jnp.where(am_last_batch, b_idx, b_idx + 1)
+        )
+        i_next = jnp.where(
+            not_done, i_idx, jnp.where(am_last_batch, last_good_block, 0)
+        )
+        nargs = list(args)
+        nargs[ragged_axis_dim] = i_next
+        nargs[stacked_axis] = b_next
+
+        return jax_core.eval_jaxpr(
+            batched_block_mapping.index_map_jaxpr.jaxpr,
+            batched_block_mapping.index_map_jaxpr.consts,
+            *nargs,
+        )
+
+      index_jaxpr = _trace_kernel_to_jaxpr(
+          index_rewrite_kernel,
+          "index_rewrite_kernel",
+          batched_grid_mapping,
+          tuple(flat_indexer_avals),
+          indexer_in_tree,
+          interpret=interpret,
+          indexer=True,
+      )
+
+      batched_block_mapping = batched_block_mapping.replace(
+          index_map_jaxpr=pe.close_jaxpr(index_jaxpr)
+      )
+      return batched_block_mapping
+
+    batched_block_mappings = map(
+        _rewrite_index_jaxpr,
+        tuple(batched_block_mappings),
+    )
+
+    batched_grid_mapping = batched_grid_mapping.replace(
+        block_mappings=tuple(batched_block_mappings),
     )
     # Important! This allows us to trace the outer kernel with the correct grid
     # to enable accessing the batch program_id.
@@ -1100,14 +1192,17 @@ def pallas_call_checkify_rule(error: checkify.Error,
   return new_error, results
 checkify.error_checks[pallas_call_p] = pallas_call_checkify_rule
 
+
 @weakref_lru_cache
-def _trace_kernel_to_jaxpr(fun: Callable,
-                           name_and_src_info: pallas_core.NameAndSrcInfo,
-                           grid_mapping: GridMapping,
-                           kernel_avals: tuple[pallas_core.AbstractMemRef, ...],
-                           kernel_in_tree: tree_util.PyTreeDef,
-                           interpret: bool,
-                           ) -> jax_core.ClosedJaxpr:
+def _trace_kernel_to_jaxpr(
+    fun: Callable,
+    name_and_src_info: pallas_core.NameAndSrcInfo,
+    grid_mapping: GridMapping,
+    kernel_avals: tuple[pallas_core.AbstractMemRef, ...],
+    kernel_in_tree: tree_util.PyTreeDef,
+    interpret: bool,
+    indexer: bool = False,
+) -> jax_core.ClosedJaxpr:
   if interpret:
     kernel_avals = tuple(map(_logical_aval_to_interpret_mode_aval,
                              kernel_avals))
@@ -1126,7 +1221,7 @@ def _trace_kernel_to_jaxpr(fun: Callable,
           "You should pass them as inputs")
 
   kernel_out_tree = out_tree_thunk()
-  if kernel_out_tree != tree_util.tree_structure(None):
+  if not indexer and kernel_out_tree != tree_util.tree_structure(None):
     raise ValueError(
         f"The kernel function in the pallas_call {name_and_src_info} "
         f"should return None. It returns a PyTree: {kernel_out_tree}")

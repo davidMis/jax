@@ -94,7 +94,7 @@ class PallasCallRaggedVmapTest(PallasBaseTest):
           grid=(1, col_grid_size),
           interpret=self.INTERPRET,
           # See note - on zero filling counterfactuals
-          debug=True,
+          debug=False,
       )(x)
 
     res = jax.vmap(
@@ -111,8 +111,20 @@ class PallasCallRaggedVmapTest(PallasBaseTest):
     ragged_total = 0
     for dim in ragged_shape:
       ragged_total += row_count * dim * 128
-    # See note - on zero filling counterfactuals
-    self.assertEqual(np.count_nonzero(res == jnp.sin(1.0)), ragged_total)
+
+    def correct(v):
+      return np.count_nonzero(v == jnp.sin(1.0))
+
+    for b, batch in enumerate(res):
+      ragged_val = ragged_shape[b]
+      for r, row in enumerate(batch):
+        row_total = ragged_val * 128
+        self.assertEqual(correct(row), row_total, msg=f"row {r}, : {row}")
+
+    # np.set_printoptions(threshold=sys.maxsize)
+    # print(res)
+
+    self.assertEqual(correct(res), ragged_total)
 
   def test_vmap_jumble_over_sin_kernel_grid_remapping(self):
     if not jtu.test_device_matches(["tpu"]):
