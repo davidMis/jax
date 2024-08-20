@@ -16,8 +16,28 @@ limitations under the License.
 #ifndef JAXLIB_GPU_SOLVER_KERNELS_FFI_H_
 #define JAXLIB_GPU_SOLVER_KERNELS_FFI_H_
 
+#include <cstdint>
+#include <optional>
+
 #include "jaxlib/gpu/vendor.h"
+#include "xla/ffi/api/c_api.h"
 #include "xla/ffi/api/ffi.h"
+
+namespace jax {
+enum class SyevdAlgorithm : uint8_t {
+  kDefault = 0,
+  kDivideAndConquer,
+  kJacobi,
+};
+}  // namespace jax
+
+template <>
+struct xla::ffi::AttrDecoding<jax::SyevdAlgorithm> {
+  using Type = jax::SyevdAlgorithm;
+  static std::optional<jax::SyevdAlgorithm> Decode(
+      XLA_FFI_AttrType type, void* attr,
+      xla::ffi::DiagnosticEngine& diagnostic);
+};
 
 namespace jax {
 namespace JAX_GPU_NAMESPACE {
@@ -25,6 +45,7 @@ namespace JAX_GPU_NAMESPACE {
 XLA_FFI_DECLARE_HANDLER_SYMBOL(GetrfFfi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(GeqrfFfi);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(OrgqrFfi);
+XLA_FFI_DECLARE_HANDLER_SYMBOL(SyevdFfi);
 
 }  // namespace JAX_GPU_NAMESPACE
 }  // namespace jax
