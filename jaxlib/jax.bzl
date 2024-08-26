@@ -296,4 +296,46 @@ def jax_generate_backend_suites(backends = []):
         tags = ["-jax_test_%s" % backend for backend in backends] + ["-manual"],
     )
 
+def _jaxlib_wheel_impl(ctx):
+    executable = ctx.executable.wheel_binary
+
+    output = ctx.actions.declare_directory("dist")
+    args = ctx.actions.args()
+    args.add("--output_path", output.path)
+    args.add("--cpu=", "$(uname -m)")
+    args.add("--jaxlib_git_hash", "$(git rev-parse HEAD)")
+
+    headers = ctx.files.headers[:]
+    for f in headers:
+        args.add("--headers=%s" % (f.path))
+
+    srcs = []
+    for src in ctx.attr.source_files:
+        for f in src.files.to_list():
+            srcs.append(f)
+            args.add("--srcs=%s" % (f.path))
+
+    args.set_param_file_format("flag_per_line")
+    args.use_param_file("@%s", use_always = False)
+    ctx.actions.run(
+        arguments = [args],
+        inputs = srcs + headers,
+        outputs = [output],
+        executable = executable,
+    )
+    return [DefaultInfo(files = depset(direct = [output]))]
+
+jaxlib_wheel = rule(
+    attrs = {
+        "source_files": attr.label_list(allow_files = True),
+        "headers": attr.label_list(allow_files = True),
+        "wheel_binary": attr.label(
+            default = Label("//jaxlib/tools:build_wheel"),
+            executable = True,
+            cfg = "exec",
+        ),
+    },
+    implementation = _jaxlib_wheel_impl,
+)
+
 jax_test_file_visibility = []
