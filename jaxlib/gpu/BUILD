@@ -14,6 +14,7 @@
 
 # Shared CUDA/ROCM GPU kernels.
 
+load("@xla//xla:xla.google.bzl", "xla_py_proto_library")
 load("//jaxlib:jax.bzl", "cc_proto_library")
 
 licenses(["notice"])
@@ -70,5 +71,15 @@ proto_library(
 
 cc_proto_library(
     name = "triton_cc_proto",
+    deps = [":triton_proto"],
+)
+
+xla_py_proto_library(
+    name = "triton_py_pb2",
+    api_version = 2,
+    visibility = [
+        "//gdm/jax/tokamax:__subpackages__",
+        "//jax:internal",
+    ],
     deps = [":triton_proto"],
 )
