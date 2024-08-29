@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 from typing import Any, NamedTuple
 
 import jax
@@ -565,6 +566,42 @@ def _flash_attention_kernel_single_batch_single_step(
   ).astype(o_tile_ref.dtype)
 
 
+def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
+  return math.prod(x.shape) * x.dtype.itemsize
+
+
+def _fwd_cost_estimate(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    ab: jax.Array | None,
+    segment_ids: SegmentIds | None,
+    *,
+    causal: bool,
+    sm_scale: jax.Array | None,
+    kernel_inputs_specs,
+    kernel_outputs_specs,
+) -> pl.CostEstimate:
+  full_cost = (
+      mha_reference.lower(
+          q, k, v, ab, segment_ids, causal=causal, sm_scale=sm_scale
+      )
+      .compile()
+      .cost_analysis()[0]
+  )
+  input_bytes = sum(
+      _bytes(x) for x in jax.tree.leaves(kernel_inputs_specs) if x is not None
+  )
+  output_bytes = sum(
+      _bytes(x) for x in jax.tree.leaves(kernel_outputs_specs) if x is not None
+  )
+  return pl.CostEstimate(
+      flops=full_cost["flops"],
+      transcendentals=full_cost["transcendentals"],
+      bytes_accessed=input_bytes + output_bytes,
+  )
+
+
 def _flash_attention_impl(
     q,
     k,
@@ -746,12 +783,23 @@ def _flash_attention_impl(
       out_shape=out_shape,
       debug=debug,
       compiler_params=pltpu.TPUCompilerParams(
-              dimension_semantics=(
-                  "parallel",
-                  "parallel",
-                  "parallel",
-                  "arbitrary",
-              )
+          dimension_semantics=(
+              "parallel",
+              "parallel",
+              "parallel",
+              "arbitrary",
+          )
+      ),
+      cost_estimate=_fwd_cost_estimate(
+          q,
+          k,
+          v,
+          ab,
+          segment_ids,
+          causal=causal,
+          sm_scale=sm_scale,
+          kernel_inputs_specs=(q, k, v, ab, q_segment_ids, kv_segment_ids),
+          kernel_outputs_specs=out_shape,
       ),
   )(q, k, v, ab, q_segment_ids, kv_segment_ids)
   if save_residuals:
