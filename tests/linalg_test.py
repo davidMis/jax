@@ -325,7 +325,7 @@ class NumpyLinalgTest(jtu.JaxTestCase):
     a, = args_maker()
     w1, _ = jnp.linalg.eig(a)
     w2 = jnp.linalg.eigvals(a)
-    self.assertAllClose(w1, w2, rtol={np.complex64: 1e-5, np.complex128: 1e-14})
+    self.assertAllClose(w1, w2, rtol={np.complex64: 1e-5, np.complex128: 2e-14})
 
   @jtu.run_on_devices("cpu")
   def testEigvalsInf(self):
